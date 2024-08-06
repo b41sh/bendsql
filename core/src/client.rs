@@ -300,6 +300,9 @@ impl APIClient {
             builder = self.auth.wrap(builder).await?;
             resp = builder.headers(headers.clone()).send().await?;
         }
+        if resp.status() == 401 {
+            return Err(Error::Unauthorized(resp.text().await?));
+        }
         if resp.status() != 200 {
             return Err(Error::Request(format!(
                 "Start Query failed with status {}: {}",

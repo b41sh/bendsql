@@ -365,7 +365,16 @@ pub async fn main() -> Result<()> {
     }
     settings.time = args.time;
 
-    let mut session = session::Session::try_new(dsn, settings, is_repl).await?;
+    let mut session = match session::Session::try_new(dsn, settings, is_repl).await {
+        Ok(session) => session,
+        Err(err) => {
+            if matches!(err, Error::Unauthorized(msg)) {
+                eprintln!(msg);
+                return Ok(());
+            }
+            return Err(err);
+        }
+    };
 
     let log_dir = format!(
         "{}/.bendsql",

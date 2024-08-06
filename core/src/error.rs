@@ -24,6 +24,7 @@ pub enum Error {
     // on accessing this next page uri.
     SessionTimeout(String),
     InvalidResponse(response::QueryError),
+    Unauthorized(String),
 }
 
 impl std::fmt::Display for Error {
@@ -40,6 +41,7 @@ impl std::fmt::Display for Error {
                 }
                 _ => write!(f, "ResponseError with {}: {}", e.code, e.message),
             },
+            Error::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
         }
     }
 }
