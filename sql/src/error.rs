@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use geozero::error::GeozeroError;
+use reqwest::StatusCode;
 
 #[derive(Debug)]
 pub struct ConvertError {
@@ -49,6 +50,16 @@ pub enum Error {
     Arrow(arrow_schema::ArrowError),
     Convert(ConvertError),
 }
+
+impl Error {
+    pub fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            Error::Api(api_error) => api_error.status_code(),
+            _ => None,
+        }
+    }
+}
+
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

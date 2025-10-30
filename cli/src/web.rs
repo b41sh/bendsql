@@ -17,7 +17,15 @@ use std::env;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
+use reqwest::StatusCode;
+use databend_driver_core::error::{Error, Result};
+use actix_web::cookie::time::Duration;
+use databend_driver::Connection;
 use crate::sql_parser::parse_sql_for_web;
+use actix_session::{Session, SessionMiddleware};
+use actix_session::config::PersistentSession;
+use actix_session::storage::CookieSessionStore;
+use actix_web::cookie::Key;
 use actix_web::dev::Server;
 use actix_web::middleware::Logger;
 use actix_web::web::Query;
@@ -165,6 +173,10 @@ async fn embed_file(path: web::Path<String>) -> HttpResponse {
 static APP_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+// Store connections by session ID
+static SESSION_CONNECTIONS: Lazy<Arc<Mutex<HashMap<String, Connection>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
 // Storage for shared queries using actual query IDs
 static SHARED_QUERIES: Lazy<Arc<Mutex<HashMap<String, SharedQuery>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
@@ -222,7 +234,7 @@ pub fn set_dsn(dsn: String) {
 }
 
 #[post("/api/query")]
-async fn execute_query(req: web::Json<QueryRequest>) -> impl Responder {
+async fn execute_query(session: Session, req: web::Json<QueryRequest>) -> impl Responder {
     let dsn = {
         let dsn_guard = DSN.as_ref();
         let dsn_option = dsn_guard.lock().unwrap();
@@ -252,16 +264,43 @@ async fn execute_query(req: web::Json<QueryRequest>) -> impl Responder {
             "error": "No valid SQL statements found"
         }));
     }
+    let mut conns = SESSION_CONNECTIONS.as_ref().lock().unwrap();
 
+    //let session_id = session.id().map_or_else(|| "N/A".to_string(), |id| id.to_string());
+    let session_id_opt = session.get::<String>("session_id");
+    println!("session_id={:?}", session_id_opt);
+    let session_id = if let Ok(Some(session_id)) = session_id_opt {
+       session_id
+    } else {
+       let session_id = uuid::Uuid::new_v4().to_string();
+       let _ = session.insert::<String>("session_id", session_id.clone());
+       session_id
+    };
+    println!("session_id={:?}", session_id);
+
+    if !conns.contains_key(&session_id) {
+            let client = Client::new(dsn.clone());
+            match client.get_conn().await {
+                Ok(conn) => {
+                    conns.insert(session_id.clone(), conn);
+                }
+                Err(e) => {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("Failed to create connection: {}", e)
+                    }));
+                }
+            }
+
+    }
+
+    let conn = conns.get(&session_id).unwrap();
+/**
     let mut results = Vec::new();
     // use one client for each http query
-    let client = Client::new(dsn.clone());
-    let mut last_query_id = None;
+    //let client = Client::new(dsn.clone());
+    let mut last_query_id: std::option::Option<String> = None;
     for statement in &statements {
         let start_time = std::time::Instant::now();
-
-        match client.get_conn().await {
-            Ok(conn) => {
                 match conn.query_iter_ext(statement).await {
                     Ok(mut rows) => {
                         let mut data = Vec::new();
@@ -321,12 +360,43 @@ async fn execute_query(req: web::Json<QueryRequest>) -> impl Responder {
                         }));
                     }
                 }
+    }
+*/
+
+    let mut results = Vec::new();
+    let mut last_query_id: std::option::Option<String> = None;
+
+    if let Err(err) = run_query(conn, &statements, &mut results, &mut last_query_id).await {
+        println!("err={:?}", err);
+        println!("err.status_code={:?}", err.status_code());
+        if let Some(StatusCode::INTERNAL_SERVER_ERROR) = err.status_code() {
+            conns.remove(&session_id);
+            let new_session_id = uuid::Uuid::new_v4().to_string();
+            println!("new_session_id={:?}", new_session_id);
+            let client = Client::new(dsn.clone());
+            match client.get_conn().await {
+                Ok(conn) => {
+                    conns.insert(new_session_id.clone(), conn);
+                }
+                Err(e) => {
+                    return HttpResponse::InternalServerError().json(serde_json::json!({
+                        "error": format!("Failed to create connection: {}", e)
+                    }));
+                }
             }
-            Err(e) => {
+            let _ = session.insert::<String>("session_id", new_session_id.clone());
+            let conn = conns.get(&new_session_id).unwrap();
+
+            if let Err(err) = run_query(conn, &statements, &mut results, &mut last_query_id).await {
+                println!("err2={:?}", err);
                 return HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": format!("Failed to create database connection: {}", e)
+                    "error": format!("Query execution failed: {}", err)
                 }));
             }
+        } else {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Query execution failed: {}", err)
+            }));
         }
     }
 
@@ -350,6 +420,69 @@ async fn execute_query(req: web::Json<QueryRequest>) -> impl Responder {
         query_id: last_query_id,
     })
 }
+
+
+async fn run_query(conn: &Connection, statements: &Vec<String>, results: &mut Vec<QueryResult>, last_query_id: &mut Option<String>) -> Result<()> {
+    for statement in statements {
+        let start_time = std::time::Instant::now();
+        let mut rows = conn.query_iter_ext(statement).await?;
+                let mut data = Vec::new();
+                let mut columns = Vec::new();
+                let mut row_count = 0;
+
+                while let Some(row_result) = rows.next().await {
+                    let row_with_stats = row_result?;
+                    match row_with_stats {
+                        RowWithStats::Row(row) => {
+                            if columns.is_empty() && !row.is_empty() {
+                                // Extract column names from schema
+                                let schema = row.schema();
+                                for field in schema.fields().iter() {
+                                    columns.push(field.name.clone());
+                                }
+                            }
+
+                            // Convert row values to string array
+                            let mut row_values = Vec::new();
+                            for value in row.values() {
+                                let str_value = value.to_string();
+                                row_values.push(str_value);
+                            }
+                            data.push(row_values);
+                            row_count += 1;
+                        }
+                        RowWithStats::Stats(_stats) => {
+                            // Skip stats for now, we could use them for additional info
+                            continue;
+                        }
+                    }
+                }
+
+                let duration = format!("{}ms", start_time.elapsed().as_millis());
+                *last_query_id = conn.last_query_id();
+                results.push(QueryResult {
+                    columns,
+                    data,
+                    row_count,
+                    duration,
+                });
+    }
+    Ok(())
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #[get("/api/query/{query_id}")]
 async fn get_shared_query(path: web::Path<String>) -> impl Responder {
@@ -389,8 +522,20 @@ async fn get_message(query: Query<MessageQuery>) -> impl Responder {
 }
 
 pub fn start_server(listener: TcpListener) -> Server {
+    let secret_key = Key::generate();
+
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                SessionMiddleware::builder(CookieSessionStore::default(), secret_key.clone())
+                    .cookie_name("bendsql_session".to_string())
+                    .cookie_secure(false)
+                    .session_lifecycle(
+                        //PersistentSession::default().session_ttl(Duration::seconds(10))
+                        PersistentSession::default().session_ttl(Duration::minutes(30))
+                    )
+                    .build()
+            )
             .wrap(Logger::default())
             .service(get_message)
             .service(execute_query)
