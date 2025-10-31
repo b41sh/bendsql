@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use geozero::error::GeozeroError;
-use reqwest::StatusCode;
 
 #[derive(Debug)]
 pub struct ConvertError {
@@ -52,14 +51,21 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn status_code(&self) -> Option<StatusCode> {
+    pub fn is_unauthenticated(&self) -> bool {
         match self {
-            Error::Api(api_error) => api_error.status_code(),
-            _ => None,
+            Error::Api(databend_client::Error::AuthFailure(_)) => {
+                return true;
+            }
+            Error::Arrow(arrow::error::ArrowError::IpcError(ref ipc_err)) => {
+                if ipc_err.contains("Unauthenticated") {
+                    return true;
+                }
+            }
+            _ => {}
         }
+        false
     }
 }
-
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -17,20 +17,20 @@ use std::env;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 
-use reqwest::StatusCode;
-use databend_driver_core::error::{Error, Result};
-use actix_web::cookie::time::Duration;
-use databend_driver::Connection;
 use crate::sql_parser::parse_sql_for_web;
-use actix_session::{Session, SessionMiddleware};
 use actix_session::config::PersistentSession;
 use actix_session::storage::CookieSessionStore;
+use actix_session::{Session, SessionMiddleware};
+use actix_web::cookie::time::Duration;
 use actix_web::cookie::Key;
 use actix_web::dev::Server;
 use actix_web::middleware::Logger;
 use actix_web::web::Query;
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use dashmap::DashMap;
+use databend_driver::Connection;
 use databend_driver::{Client, RowWithStats};
+use databend_driver_core::error::Result;
 use mime_guess::from_path;
 use once_cell::sync::Lazy;
 use rust_embed::RustEmbed;
@@ -174,8 +174,10 @@ static APP_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Store connections by session ID
-static SESSION_CONNECTIONS: Lazy<Arc<Mutex<HashMap<String, Connection>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+//static SESSION_CONNECTIONS: Lazy<Arc<Mutex<HashMap<String, Connection>>>> =
+//    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static SESSION_CONNECTIONS: Lazy<Arc<DashMap<String, Connection>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
 
 // Storage for shared queries using actual query IDs
 static SHARED_QUERIES: Lazy<Arc<Mutex<HashMap<String, SharedQuery>>>> =
@@ -265,62 +267,41 @@ async fn execute_query(session: Session, req: web::Json<QueryRequest>) -> impl R
             "error": "No valid SQL statements found"
         }));
     }
-    let mut conns = SESSION_CONNECTIONS.as_ref().lock().unwrap();
 
-    //let session_id = session.id().map_or_else(|| "N/A".to_string(), |id| id.to_string());
     let session_id_opt = session.get::<String>("session_id");
-    println!("session_id={:?}", session_id_opt);
     let session_id = if let Ok(Some(session_id)) = session_id_opt {
-       session_id
+        session_id
     } else {
-       let session_id = uuid::Uuid::new_v4().to_string();
-       let _ = session.insert::<String>("session_id", session_id.clone());
-       session_id
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let _ = session.insert::<String>("session_id", session_id.clone());
+        session_id
     };
-    println!("session_id={:?}", session_id);
 
-    if !conns.contains_key(&session_id) {
-            let client = Client::new(dsn.clone());
-            match client.get_conn().await {
-                Ok(conn) => {
-                    conns.insert(session_id.clone(), conn);
-                }
-                Err(e) => {
-                    return HttpResponse::InternalServerError().json(serde_json::json!({
-                        "error": format!("Failed to create connection: {}", e)
-                    }));
-                }
-            }
-
-    }
-
-    let conn = conns.get(&session_id).unwrap();
     let mut results = Vec::new();
     let mut last_query_id: std::option::Option<String> = None;
-
-    if let Err(err) = run_query(conn, &statements, &mut results, &mut last_query_id).await {
-        println!("err={:?}", err);
-        println!("err.status_code={:?}", err.status_code());
-        if let Some(StatusCode::INTERNAL_SERVER_ERROR) = err.status_code() {
-            conns.remove(&session_id);
+    if let Err(err) = run_query(
+        &dsn,
+        &session_id,
+        &statements,
+        &mut results,
+        &mut last_query_id,
+    )
+    .await
+    {
+        if err.is_unauthenticated() {
+            SESSION_CONNECTIONS.remove(&session_id);
             let new_session_id = uuid::Uuid::new_v4().to_string();
-            println!("new_session_id={:?}", new_session_id);
-            let client = Client::new(dsn.clone());
-            match client.get_conn().await {
-                Ok(conn) => {
-                    conns.insert(new_session_id.clone(), conn);
-                }
-                Err(e) => {
-                    return HttpResponse::InternalServerError().json(serde_json::json!({
-                        "error": format!("Failed to create connection: {}", e)
-                    }));
-                }
-            }
             let _ = session.insert::<String>("session_id", new_session_id.clone());
-            let conn = conns.get(&new_session_id).unwrap();
 
-            if let Err(err) = run_query(conn, &statements, &mut results, &mut last_query_id).await {
-                println!("err2={:?}", err);
+            if let Err(err) = run_query(
+                &dsn,
+                &new_session_id,
+                &statements,
+                &mut results,
+                &mut last_query_id,
+            )
+            .await
+            {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Query execution failed: {}", err)
                 }));
@@ -353,78 +334,70 @@ async fn execute_query(session: Session, req: web::Json<QueryRequest>) -> impl R
     })
 }
 
+async fn run_query(
+    dsn: &str,
+    session_id: &str,
+    statements: &Vec<String>,
+    results: &mut Vec<QueryResult>,
+    last_query_id: &mut Option<String>,
+) -> Result<()> {
+    if !SESSION_CONNECTIONS.contains_key(session_id) {
+        let client = Client::new(dsn.to_string());
+        let conn = client.get_conn().await?;
+        SESSION_CONNECTIONS.insert(session_id.to_string(), conn);
+    }
+    let conn = SESSION_CONNECTIONS.get(session_id).unwrap();
 
-async fn run_query(conn: &Connection, statements: &Vec<String>, results: &mut Vec<QueryResult>, last_query_id: &mut Option<String>) -> Result<()> {
     for statement in statements {
         let start_time = std::time::Instant::now();
-        let mut rows = conn.query_iter_ext(statement).await?;
-                let mut data = Vec::new();
-                let mut columns = Vec::new();
-                let mut types = Vec::new();
-                let mut row_count = 0;
+        let rows = &mut conn.query_iter_ext(statement).await?;
+        let mut data = Vec::new();
+        let mut columns = Vec::new();
+        let mut types = Vec::new();
+        let mut row_count = 0;
 
-                while let Some(row_result) = rows.next().await {
-                    let row_with_stats = row_result?;
-                    match row_with_stats {
-                        RowWithStats::Row(row) => {
-                            if columns.is_empty() && !row.is_empty() {
-                                // Extract column names from schema
-                                let schema = row.schema();
-                                for field in schema.fields().iter() {
-                                    columns.push(field.name.clone());
-                                    types.push(field.data_type.to_string());
-                                }
-                            }
-
-                            // Convert row values to string array
-                            let mut row_values = Vec::new();
-                            for value in row.values() {
-                                let str_value = value.to_string();
-                                row_values.push(str_value);
-                            }
-                            data.push(row_values);
-                            row_count += 1;
-                        }
-                        RowWithStats::Stats(_stats) => {
-                            // Skip stats for now, we could use them for additional info
-                            continue;
+        while let Some(row_result) = rows.next().await {
+            let row_with_stats = row_result?;
+            match row_with_stats {
+                RowWithStats::Row(row) => {
+                    if columns.is_empty() && !row.is_empty() {
+                        // Extract column names from schema
+                        let schema = row.schema();
+                        for field in schema.fields().iter() {
+                            columns.push(field.name.clone());
+                            types.push(field.data_type.to_string());
                         }
                     }
-                }
 
-                let duration = format!("{}ms", start_time.elapsed().as_millis());
-                *last_query_id = conn.last_query_id();
-                results.push(QueryResult {
-                    columns,
-                    types,
-                    data,
-                    row_count,
-                    duration,
-                });
+                    // Convert row values to string array
+                    let mut row_values = Vec::new();
+                    for value in row.values() {
+                        let str_value = value.to_string();
+                        row_values.push(str_value);
+                    }
+                    data.push(row_values);
+                    row_count += 1;
+                }
+                RowWithStats::Stats(_stats) => {
+                    // Skip stats for now, we could use them for additional info
+                    continue;
+                }
+            }
+        }
+
+        let duration = format!("{}ms", start_time.elapsed().as_millis());
+        *last_query_id = conn.last_query_id();
+        results.push(QueryResult {
+            columns,
+            types,
+            data,
+            row_count,
+            duration,
+        });
     }
+
     Ok(())
 }
-
-
-
-                results.push(QueryResult {
-                    columns,
-                    types,
-                    data,
-                    row_count,
-                    duration,
-                });
-
-
-
-
-
-
-
-
-
-
-
 
 #[get("/api/query/{query_id}")]
 async fn get_shared_query(path: web::Path<String>) -> impl Responder {
@@ -474,9 +447,9 @@ pub fn start_server(listener: TcpListener) -> Server {
                     .cookie_secure(false)
                     .session_lifecycle(
                         //PersistentSession::default().session_ttl(Duration::seconds(10))
-                        PersistentSession::default().session_ttl(Duration::minutes(30))
+                        PersistentSession::default().session_ttl(Duration::minutes(30)),
                     )
-                    .build()
+                    .build(),
             )
             .wrap(Logger::default())
             .service(get_message)
