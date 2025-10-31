@@ -174,8 +174,6 @@ static APP_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Store connections by session ID
-//static SESSION_CONNECTIONS: Lazy<Arc<Mutex<HashMap<String, Connection>>>> =
-//    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 static SESSION_CONNECTIONS: Lazy<Arc<DashMap<String, Connection>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -277,41 +275,31 @@ async fn execute_query(session: Session, req: web::Json<QueryRequest>) -> impl R
         session_id
     };
 
-    let mut results = Vec::new();
-    let mut last_query_id: std::option::Option<String> = None;
-    if let Err(err) = run_query(
-        &dsn,
-        &session_id,
-        &statements,
-        &mut results,
-        &mut last_query_id,
-    )
-    .await
-    {
-        if err.is_unauthenticated() {
-            SESSION_CONNECTIONS.remove(&session_id);
-            let new_session_id = uuid::Uuid::new_v4().to_string();
-            let _ = session.insert::<String>("session_id", new_session_id.clone());
+    let (last_query_id, results) = match run_query(&dsn, &session_id, &statements).await {
+        Ok((last_query_id, results)) => (last_query_id, results),
+        Err(err) => {
+            if err.is_unauthenticated() {
+                SESSION_CONNECTIONS.remove(&session_id);
+                let new_session_id = uuid::Uuid::new_v4().to_string();
+                let _ = session.insert::<String>("session_id", new_session_id.clone());
 
-            if let Err(err) = run_query(
-                &dsn,
-                &new_session_id,
-                &statements,
-                &mut results,
-                &mut last_query_id,
-            )
-            .await
-            {
+                let (last_query_id, results) =
+                    match run_query(&dsn, &new_session_id, &statements).await {
+                        Ok((last_query_id, results)) => (last_query_id, results),
+                        Err(err) => {
+                            return HttpResponse::InternalServerError().json(serde_json::json!({
+                                "error": format!("Query execution failed: {}", err)
+                            }));
+                        }
+                    };
+                (last_query_id, results)
+            } else {
                 return HttpResponse::InternalServerError().json(serde_json::json!({
                     "error": format!("Query execution failed: {}", err)
                 }));
             }
-        } else {
-            return HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Query execution failed: {}", err)
-            }));
         }
-    }
+    };
 
     if let Some(ref last_id) = last_query_id {
         let shared_query = SharedQuery {
@@ -338,9 +326,7 @@ async fn run_query(
     dsn: &str,
     session_id: &str,
     statements: &Vec<String>,
-    results: &mut Vec<QueryResult>,
-    last_query_id: &mut Option<String>,
-) -> Result<()> {
+) -> Result<(Option<String>, Vec<QueryResult>)> {
     if !SESSION_CONNECTIONS.contains_key(session_id) {
         let client = Client::new(dsn.to_string());
         let conn = client.get_conn().await?;
@@ -348,6 +334,8 @@ async fn run_query(
     }
     let conn = SESSION_CONNECTIONS.get(session_id).unwrap();
 
+    let mut last_query_id = None;
+    let mut results = Vec::new();
     for statement in statements {
         let start_time = std::time::Instant::now();
         let rows = &mut conn.query_iter_ext(statement).await?;
@@ -386,7 +374,7 @@ async fn run_query(
         }
 
         let duration = format!("{}ms", start_time.elapsed().as_millis());
-        *last_query_id = conn.last_query_id();
+        last_query_id = conn.last_query_id();
         results.push(QueryResult {
             columns,
             types,
@@ -396,7 +384,7 @@ async fn run_query(
         });
     }
 
-    Ok(())
+    Ok((last_query_id, results))
 }
 
 #[get("/api/query/{query_id}")]
