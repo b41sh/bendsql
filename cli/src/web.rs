@@ -173,13 +173,15 @@ async fn embed_file(path: web::Path<String>) -> HttpResponse {
 static APP_DATA: Lazy<Arc<Mutex<HashMap<usize, String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+// Storage for shared queries using actual query IDs
+static SHARED_QUERIES: Lazy<Arc<Mutex<HashMap<String, SharedQuery>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
 // Store connections by session ID
 static SESSION_CONNECTIONS: Lazy<Arc<DashMap<String, Connection>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-// Storage for shared queries using actual query IDs
-static SHARED_QUERIES: Lazy<Arc<Mutex<HashMap<String, SharedQuery>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+const SESSION_ID_KEY: &str = "session_id";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct SharedQuery {
@@ -266,22 +268,24 @@ async fn execute_query(session: Session, req: web::Json<QueryRequest>) -> impl R
         }));
     }
 
-    let session_id_opt = session.get::<String>("session_id");
-    let session_id = if let Ok(Some(session_id)) = session_id_opt {
+    // Use session id to store connections and prevent duplicate connections.
+    let session_id = if let Ok(Some(session_id)) = session.get::<String>(SESSION_ID_KEY) {
         session_id
     } else {
         let session_id = uuid::Uuid::new_v4().to_string();
-        let _ = session.insert::<String>("session_id", session_id.clone());
+        let _ = session.insert::<String>(SESSION_ID_KEY, session_id.clone());
         session_id
     };
 
     let (last_query_id, results) = match run_query(&dsn, &session_id, &statements).await {
         Ok((last_query_id, results)) => (last_query_id, results),
         Err(err) => {
+            // If connection is unauthenticated, generate a new session id,
+            // and try to reconnet to the server.
             if err.is_unauthenticated() {
                 SESSION_CONNECTIONS.remove(&session_id);
                 let new_session_id = uuid::Uuid::new_v4().to_string();
-                let _ = session.insert::<String>("session_id", new_session_id.clone());
+                let _ = session.insert::<String>(SESSION_ID_KEY, new_session_id.clone());
 
                 let (last_query_id, results) =
                     match run_query(&dsn, &new_session_id, &statements).await {
@@ -434,8 +438,7 @@ pub fn start_server(listener: TcpListener) -> Server {
                     .cookie_name("bendsql_session".to_string())
                     .cookie_secure(false)
                     .session_lifecycle(
-                        //PersistentSession::default().session_ttl(Duration::seconds(10))
-                        PersistentSession::default().session_ttl(Duration::minutes(30)),
+                        PersistentSession::default().session_ttl(Duration::minutes(60)),
                     )
                     .build(),
             )
