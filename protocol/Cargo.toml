@@ -1,0 +1,18 @@
+[package]
+name = "databend-protocol"
+description = "Databend's HTTP query protocol, without I/O: requests to send, responses to read"
+categories = ["database"]
+keywords = ["databend", "database", "protocol"]
+
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+# Only `std`: this crate must not turn on serde_json features (`arbitrary_precision`,
+# `preserve_order`, `unbounded_depth`) in the programs that use it.
+serde_json = { version = "1.0", default-features = false, features = ["std"] }

@@ -1,6 +1,7 @@
 [workspace]
-default-members = ["core", "sql", "driver", "macros", "cli"]
+default-members = ["protocol", "core", "sql", "driver", "macros", "cli"]
 members = [
+    "protocol",
     "core",
     "sql",
     "driver",
@@ -22,6 +23,7 @@ keywords = ["databend", "database", "rust"]
 repository = "https://github.com/databendlabs/bendsql"
 
 [workspace.dependencies]
+databend-protocol = { path = "protocol", version = "0.34.3" }
 databend-client = { path = "core", version = "0.34.3" }
 databend-driver = { path = "driver", version = "0.34.3" }
 databend-driver-core = { path = "sql", version = "0.34.3" }
