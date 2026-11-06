@@ -14,8 +14,9 @@
 
 //! Reading the cells of a JSON result whose text depends on the result's settings.
 //!
-//! Every cell of a JSON page is text (or `null`). Numbers, dates and strings are left to the
-//! caller to parse; binary and geometry cells are encoded as the result's settings say.
+//! Every cell of a JSON page is text (or `null`). These read the kinds whose text a caller
+//! would otherwise have to know: booleans (`1` and `0`), numbers, and binary and geometry cells,
+//! encoded as the result's settings say. Dates and strings are left as text.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
@@ -30,6 +31,44 @@ pub enum Geometry {
     Binary(Vec<u8>),
     /// WKT, EWKT or GeoJSON.
     Text(String),
+}
+
+/// A `Boolean` cell: the server writes `1` and `0`; `true` and `false` (any case) are taken too.
+pub fn boolean(cell: &str) -> Result<bool, Error> {
+    match cell.trim() {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        t if t.eq_ignore_ascii_case("true") => Ok(true),
+        t if t.eq_ignore_ascii_case("false") => Ok(false),
+        _ => Err(not_a("Boolean", cell)),
+    }
+}
+
+/// A signed integer cell (`Int8` to `Int64`, and unsigned ones that fit).
+pub fn int(cell: &str) -> Result<i64, Error> {
+    cell.trim()
+        .parse()
+        .map_err(|_| not_a("signed integer", cell))
+}
+
+/// An unsigned integer cell (`UInt8` to `UInt64`, counts).
+pub fn uint(cell: &str) -> Result<u64, Error> {
+    cell.trim()
+        .parse()
+        .map_err(|_| not_a("unsigned integer", cell))
+}
+
+/// A `Float32`, `Float64` or `Decimal` cell as a double (a decimal of more than about 15 digits
+/// loses its last ones). `inf`, `-inf` and `nan` read as themselves.
+pub fn float(cell: &str) -> Result<f64, Error> {
+    cell.trim().parse().map_err(|_| not_a("number", cell))
+}
+
+fn not_a(what: &str, cell: &str) -> Error {
+    Error::Protocol(format!(
+        "a {what} cell holds {:?}",
+        cell.chars().take(64).collect::<String>()
+    ))
 }
 
 /// The bytes of a `Binary` cell.
@@ -86,6 +125,27 @@ pub fn hex(text: &str) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn booleans_and_numbers() {
+        assert!(boolean("1").unwrap());
+        assert!(!boolean("0").unwrap());
+        assert!(boolean("TRUE").unwrap());
+        assert!(boolean("2").is_err());
+        assert_eq!(int("-42").unwrap(), -42);
+        assert!(int("18446744073709551615").is_err());
+        assert_eq!(uint("18446744073709551615").unwrap(), u64::MAX);
+        assert!(uint("-1").is_err());
+        assert_eq!(float("12.5").unwrap(), 12.5);
+        assert!((float("123456789.123456789").unwrap() - 123_456_789.123_456_79).abs() < 1e-6);
+        assert!(float("inf").unwrap().is_infinite());
+        assert!(float("1,5").is_err());
+        let long = "x".repeat(10_000);
+        let Err(Error::Protocol(m)) = int(&long) else {
+            panic!("expected an error")
+        };
+        assert!(m.len() < 200);
+    }
 
     #[test]
     fn binary_formats() {

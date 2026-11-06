@@ -417,3 +417,193 @@ fn hostile_responses_never_panic() {
         }
     }
 }
+
+/// A transport answering from a list, recording what it was sent.
+#[derive(Default)]
+struct Script {
+    responses: std::collections::VecDeque<Result<HttpResponse, &'static str>>,
+    sent: Vec<HttpRequest>,
+    kills: Vec<HttpRequest>,
+    waits: Vec<std::time::Duration>,
+}
+
+impl Script {
+    fn new(responses: Vec<Result<HttpResponse, &'static str>>) -> Self {
+        Script {
+            responses: responses.into(),
+            ..Script::default()
+        }
+    }
+}
+
+impl Transport for Script {
+    type Error = &'static str;
+    fn send(&mut self, request: HttpRequest) -> Result<HttpResponse, &'static str> {
+        self.sent.push(request);
+        self.responses
+            .pop_front()
+            .unwrap_or(Err("no response left"))
+    }
+    fn send_kill(&mut self, request: HttpRequest) {
+        self.kills.push(request);
+    }
+    fn wait(&mut self, delay: std::time::Duration) {
+        self.waits.push(delay);
+    }
+}
+
+fn final_response() -> HttpResponse {
+    ok(json!({"id": "q1", "schema": [], "data": [], "state": "Succeeded", "next_uri": null}))
+}
+
+#[test]
+fn query_all_reads_every_page() {
+    let mut client = client();
+    let mut http = Script::new(vec![
+        Ok(ok(page(json!([["1", "a"]]), Some("/v1/query/q1/page/1")))),
+        Ok(ok(page(json!([["2", null]]), Some("/v1/query/q1/final")))),
+        Ok(final_response()),
+    ]);
+    let result = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap();
+    assert_eq!(result.id, "q1");
+    assert_eq!(result.schema.len(), 2);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Some("1".into()), Some("a".into())],
+            vec![Some("2".into()), None]
+        ]
+    );
+    assert_eq!(result.warnings, vec!["slow plan".to_string()]);
+    assert_eq!(
+        result.settings.geometry_format().unwrap(),
+        GeometryDataType::WKB
+    );
+    let urls: Vec<&str> = http.sent.iter().map(|r| r.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        [
+            format!("{ENDPOINT}/v1/query"),
+            format!("{ENDPOINT}/v1/query/q1/page/1"),
+            format!("{ENDPOINT}/v1/query/q1/final"),
+        ]
+    );
+    assert!(http.kills.is_empty() && http.waits.is_empty());
+}
+
+#[test]
+fn query_all_waits_out_a_busy_server() {
+    let mut client = client();
+    let busy = || Ok(HttpResponse::new(503, "starting"));
+    let mut http = Script::new(vec![
+        busy(),
+        busy(),
+        Ok(ok(page(json!([["1", "a"]]), None))),
+    ]);
+    let result = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap();
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(
+        http.waits,
+        [blocking::RETRY_DELAY, blocking::RETRY_DELAY * 2]
+    );
+    assert_eq!(
+        http.sent.first(),
+        http.sent.get(2),
+        "the same request each time"
+    );
+
+    // past the retries: an error, and the statement killed
+    let mut client = self::client();
+    let mut http = Script::new(vec![busy(), busy(), busy(), busy(), busy()]);
+    let err = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap_err();
+    assert_eq!(err.databend().map(Error::kind), Some(ErrorKind::Lost));
+    assert_eq!(http.sent.len(), 1 + blocking::MAX_RETRIES as usize);
+    assert_eq!(http.kills.len(), 1);
+}
+
+#[test]
+fn query_all_refreshes_an_expired_session_token() {
+    let mut client = logged_in();
+    let expired = HttpResponse::new(401, r#"{"error":{"code":5101,"message":"expired"}}"#);
+    let mut http = Script::new(vec![
+        Ok(ok(page(json!([["1", "a"]]), Some("/v1/query/q1/page/1")))),
+        Ok(expired),
+        Ok(ok(json!({"session_token": "s2", "refresh_token": "r2"}))),
+        Ok(ok(page(json!([["2", "b"]]), None))),
+    ]);
+    let result = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap();
+    assert_eq!(result.rows.len(), 2);
+    let refresh = http.sent.get(2).unwrap();
+    assert!(refresh.url.ends_with("/v1/session/refresh"));
+    let again = http.sent.get(3).unwrap();
+    assert!(again.url.ends_with("/v1/query/q1/page/1"));
+    assert_eq!(again.header(AUTHORIZATION), Some("Bearer s2"));
+    assert!(http.waits.is_empty(), "a refresh needs no wait");
+}
+
+#[test]
+fn query_all_kills_what_fails() {
+    // the statement fails
+    let mut client = client();
+    let mut body = page(json!([]), Some("/v1/query/q1/final"));
+    body["error"] = json!({"code": 1025, "message": "Unknown table"});
+    let mut http = Script::new(vec![Ok(ok(body))]);
+    let err = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap_err();
+    assert_eq!(err.databend().map(Error::kind), Some(ErrorKind::Statement));
+    assert_eq!(http.kills.len(), 1);
+    assert!(http
+        .kills
+        .first()
+        .unwrap()
+        .url
+        .ends_with("/v1/query/q1/kill"));
+
+    // a page gets no response
+    let mut client = self::client();
+    let mut http = Script::new(vec![
+        Ok(ok(page(json!([["1", "a"]]), Some("/v1/query/q1/page/1")))),
+        Err("connection reset"),
+    ]);
+    let err = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap_err();
+    assert!(matches!(err, QueryError::Transport("connection reset")));
+    assert_eq!(http.kills.len(), 1);
+
+    // more rows than allowed
+    let config = ClientConfig::new(ENDPOINT, Auth::basic("root", "")).with_max_rows(2);
+    let mut client = Client::new(config, 5).unwrap();
+    let mut http = Script::new(vec![
+        Ok(ok(page(
+            json!([["1", "a"], ["2", "b"]]),
+            Some("/v1/query/q1/page/1"),
+        ))),
+        Ok(ok(page(json!([["3", "c"]]), None))),
+    ]);
+    let err = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap_err();
+    assert_eq!(err.databend().map(Error::kind), Some(ErrorKind::Protocol));
+    assert_eq!(http.kills.len(), 1);
+}
+
+#[test]
+fn query_all_keeps_the_rows_when_the_final_request_fails() {
+    for last in [Err("connection reset"), Ok(HttpResponse::new(500, "oops"))] {
+        let mut client = client();
+        let mut http = Script::new(vec![
+            Ok(ok(page(json!([["1", "a"]]), Some("/v1/query/q1/final")))),
+            last,
+        ]);
+        let result =
+            query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert!(http.kills.is_empty());
+    }
+}
+
+#[test]
+fn query_all_kills_after_a_response_it_cannot_read() {
+    let config = ClientConfig::new(ENDPOINT, Auth::basic("root", ""));
+    let mut client = Client::new(config, 1).unwrap();
+    let mut http = Script::new(vec![Ok(ok(json!("not a query response")))]);
+    let err = query_all(&mut client, &mut http, "SELECT 1", QueryOptions::default()).unwrap_err();
+    assert_eq!(err.databend().map(Error::kind), Some(ErrorKind::Protocol));
+    assert_eq!(http.kills.len(), 1, "the statement may run: it is stopped");
+}

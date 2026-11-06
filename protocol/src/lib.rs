@@ -40,6 +40,34 @@
 //! # }
 //! ```
 //!
+//! A blocking caller can leave the loop, the retries and the kill to [`query_all`], with a
+//! [`Transport`] that sends the requests:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use databend_protocol::{query_all, Auth, Client, ClientConfig, QueryOptions, Transport};
+//! use databend_protocol::{HttpRequest, HttpResponse};
+//!
+//! struct MyHttp;
+//! impl Transport for MyHttp {
+//!     type Error = std::io::Error;
+//!     fn send(&mut self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+//!         unimplemented!("send it with any HTTP client")
+//!     }
+//!     fn wait(&mut self, delay: Duration) {
+//!         std::thread::sleep(delay)
+//!     }
+//! }
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ClientConfig::new("http://localhost:8000", Auth::basic("root", ""));
+//! let mut client = Client::new(config, 42)?;
+//! let result = query_all(&mut client, &mut MyHttp, "SELECT 1", QueryOptions::default())?;
+//! assert_eq!(result.rows.len(), 1);
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! Everything the server sends is untrusted: bodies are size-limited, next URIs must stay on the
 //! configured endpoint, and nothing here panics on malformed input.
 
@@ -56,6 +84,7 @@
     )
 )]
 
+pub mod blocking;
 mod capability;
 pub mod cell;
 mod client;
@@ -69,10 +98,11 @@ pub mod schema;
 mod session;
 mod settings;
 
+pub use blocking::{query_all, QueryError, QueryResult, Transport};
 pub use capability::Capability;
 pub use client::{Client, LoginInfo};
 pub use config::{Auth, ClientConfig, Pagination, SensitiveString};
-pub use error::{need_refresh_token, Error, ErrorCode, ResponseWithErrorCode, Result};
+pub use error::{need_refresh_token, Error, ErrorCode, ErrorKind, ResponseWithErrorCode, Result};
 pub use http::{HttpRequest, HttpResponse, Method};
 pub use query::{Next, Query, QueryOptions, Step};
 pub use request::{

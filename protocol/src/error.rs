@@ -16,8 +16,45 @@ use std::fmt::{self, Display, Formatter};
 
 use serde::Deserialize;
 
+const ABORTED_QUERY: u16 = 1043;
+const UNKNOWN_USER: u16 = 2201;
+const INVALID_PASSWORD: u16 = 2215;
+const AUTHENTICATE_FAILURE: u16 = 5100;
 const SESSION_TOKEN_EXPIRED: u16 = 5101;
+const REFRESH_TOKEN_EXPIRED: u16 = 5102;
 const SESSION_TOKEN_NOT_FOUND: u16 = 5103;
+const REFRESH_TOKEN_NOT_FOUND: u16 = 5104;
+
+/// What an error means for the caller, from its status and the server's code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The settings can't make requests.
+    Config,
+    /// The credentials were refused: asking again won't help.
+    Login,
+    /// The server stopped the statement: it ran past `max_execute_time_in_seconds`, or was killed.
+    Aborted,
+    /// The server lost the session or the query (a restart, an expired token, a page on another
+    /// node, a 5xx): the statement may succeed on a new session. Whether running it again is
+    /// safe is the caller's call (a read is; an insert may run twice).
+    Lost,
+    /// The statement failed: a missing table, a syntax error, a type error.
+    Statement,
+    /// A response that isn't the protocol's.
+    Protocol,
+}
+
+fn kind_of_code(code: u16) -> Option<ErrorKind> {
+    match code {
+        UNKNOWN_USER | INVALID_PASSWORD | AUTHENTICATE_FAILURE => Some(ErrorKind::Login),
+        ABORTED_QUERY => Some(ErrorKind::Aborted),
+        SESSION_TOKEN_EXPIRED
+        | REFRESH_TOKEN_EXPIRED
+        | SESSION_TOKEN_NOT_FOUND
+        | REFRESH_TOKEN_NOT_FOUND => Some(ErrorKind::Lost),
+        _ => None,
+    }
+}
 
 /// The most of an unexpected body an error message quotes.
 const MAX_QUOTED_BODY_CHARS: usize = 512;
@@ -84,6 +121,24 @@ impl Error {
             Error::Login(e) | Error::TokenExpired(e) | Error::Query(e) => Some(e.code),
             Error::Http { error, .. } => error.as_ref().map(|e| e.code),
             Error::Config(_) | Error::QueryNotFound(_) | Error::Protocol(_) => None,
+        }
+    }
+
+    /// What the error means for the caller.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Error::Config(_) => ErrorKind::Config,
+            Error::Login(_) => ErrorKind::Login,
+            Error::TokenExpired(_) | Error::QueryNotFound(_) => ErrorKind::Lost,
+            Error::Query(e) => kind_of_code(e.code).unwrap_or(ErrorKind::Statement),
+            Error::Http { status, error, .. } => {
+                match error.as_ref().and_then(|e| kind_of_code(e.code)) {
+                    Some(kind) => kind,
+                    None if *status >= 500 => ErrorKind::Lost,
+                    None => ErrorKind::Statement,
+                }
+            }
+            Error::Protocol(_) => ErrorKind::Protocol,
         }
     }
 
@@ -203,6 +258,36 @@ mod tests {
         assert_eq!(e.status(), Some(503));
         let e = Error::from_status(400, br#"{"error":{"code":1005,"message":"syntax"}}"#, false);
         assert_eq!(e.code(), Some(1005));
+    }
+
+    #[test]
+    fn kinds() {
+        let code = |code: u16| ErrorCode {
+            code,
+            message: "m".into(),
+            detail: None,
+        };
+        assert_eq!(Error::Query(code(1043)).kind(), ErrorKind::Aborted);
+        assert_eq!(Error::Query(code(1025)).kind(), ErrorKind::Statement);
+        assert_eq!(Error::Query(code(2215)).kind(), ErrorKind::Login);
+        assert_eq!(Error::Query(code(5104)).kind(), ErrorKind::Lost);
+        assert_eq!(Error::Login(code(0)).kind(), ErrorKind::Login);
+        assert_eq!(Error::QueryNotFound("q".into()).kind(), ErrorKind::Lost);
+        assert_eq!(
+            Error::from_status(502, b"bad gateway", false).kind(),
+            ErrorKind::Lost
+        );
+        assert_eq!(
+            Error::from_status(400, b"bad", false).kind(),
+            ErrorKind::Statement
+        );
+        let body = br#"{"error":{"code":5100,"message":"no"}}"#;
+        assert_eq!(
+            Error::from_status(403, body, false).kind(),
+            ErrorKind::Login
+        );
+        assert_eq!(Error::Protocol("x".into()).kind(), ErrorKind::Protocol);
+        assert_eq!(Error::Config("x".into()).kind(), ErrorKind::Config);
     }
 
     #[test]

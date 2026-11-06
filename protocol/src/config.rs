@@ -140,6 +140,9 @@ pub struct ClientConfig {
     pub session_tokens: bool,
     /// The largest response body read; a larger one is an error.
     pub max_body_bytes: usize,
+    /// The most rows a statement may return over all its pages; more is an error. `None` (the
+    /// default) is no limit but the caller's patience.
+    pub max_rows: Option<usize>,
 }
 
 /// How the server pages results: how long a page waits for rows, and how many rows it holds.
@@ -156,6 +159,7 @@ impl ClientConfig {
             pagination: None,
             session_tokens: true,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            max_rows: None,
         }
     }
 
@@ -186,6 +190,11 @@ impl ClientConfig {
 
     pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
         self.max_body_bytes = max_body_bytes;
+        self
+    }
+
+    pub fn with_max_rows(mut self, max_rows: usize) -> Self {
+        self.max_rows = Some(max_rows);
         self
     }
 

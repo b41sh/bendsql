@@ -69,6 +69,7 @@ It builds for `wasm32-unknown-unknown`. `#![forbid(unsafe_code)]`, and no `unwra
 | `cell` | decoding helpers for JSON cells: binary, geometry, hex | new (the hex/base64 part of `sql/value/string_decoder.rs`) |
 | `client` | `Client`: the session, cookies, auth and node a connection carries; builds requests | the request building of `APIClient` |
 | `query` | `Query`, `Step`, `Next`, `QueryOptions`: one statement's paging | `core/pages.rs` without the `Stream` |
+| `blocking` | `Transport`, `query_all`, `QueryResult`, `QueryError`: a statement run to its end | new (the loop RustGIS had) |
 
 ## The API
 
@@ -127,7 +128,10 @@ it (`need_sticky`), and keeps the route hint inside a transaction.
 5101 or 5103 while using a session token: refresh, then `retry_request`), `Query` (the statement
 failed), `QueryNotFound` (a 404 after the first response), `Http` (another status, with the
 server's `ErrorCode` when the body had one) and `Protocol` (a response that isn't the
-protocol's). `is_retryable()` is true for `TokenExpired` and a 503. No error holds a password,
+protocol's). `is_retryable()` is true for `TokenExpired` and a 503. `kind()` says what an error means
+from its status and the server's code: `Login` (2201, 2215, 5100), `Aborted` (1043: past
+`max_execute_time_in_seconds`, or killed), `Lost` (5101 to 5104, a lost page, a 5xx: the
+statement may succeed on a new session), `Statement`, `Protocol` or `Config`. No error holds a password,
 a token or an `authorization` header, and JSON that fails to decode is reported by position, not
 quoted, since a login's body holds tokens.
 
@@ -147,9 +151,19 @@ quoted, since a login's body holds tokens.
 ## Using it
 
 The loop in the crate's documentation (`protocol/src/lib.rs`): start a query, send each request,
-hand its response to `on_response`, keep the rows, follow `Next` until `Done`. On an error,
-send `kill_request` if the caller won't wait for the query; after a `TokenExpired`, refresh and
-send `retry_request`.
+hand its response to `on_response`, keep the rows, follow `Next` until `Done`.
+
+A blocking caller can leave that to `query_all` (module `blocking`), with a `Transport` that
+sends requests (`send`, and `send_kill` for the kill after a failure) and waits (`wait`). It
+pages through the result, waits out a 503 and refreshes an expired session token (at most
+three times a request), kills the statement when it fails, and returns a `QueryResult` (id,
+schema, rows, settings, stats, warnings). It doesn't run a statement again after a lost
+session: whether that is safe depends on the statement. The transport bounds how long requests
+take; the crate reads no clock.
+
+`ClientConfig::max_rows` caps the rows a statement may return over all its pages (no cap by
+default). `cell::boolean`, `int`, `uint` and `float` read the JSON format's cells (booleans
+are `1` and `0`), next to `cell::binary` and `cell::geometry`.
 
 ## Changes to the other crates
 

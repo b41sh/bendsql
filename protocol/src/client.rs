@@ -102,6 +102,11 @@ impl Client {
         self.config.max_body_bytes
     }
 
+    /// The most rows a statement may return, as configured.
+    pub fn max_rows(&self) -> Option<usize> {
+        self.config.max_rows
+    }
+
     /// `http(s)://host:port`, as configured.
     pub fn endpoint(&self) -> &str {
         &self.endpoint

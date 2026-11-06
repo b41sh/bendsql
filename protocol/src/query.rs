@@ -85,6 +85,8 @@ pub struct Query {
     finished: bool,
     schema: Vec<SchemaField>,
     settings: QueryResultFormatSettings,
+    /// The rows the responses have given so far.
+    rows: usize,
 }
 
 impl Query {
@@ -98,6 +100,7 @@ impl Query {
             finished: false,
             schema: Vec::new(),
             settings: QueryResultFormatSettings::default(),
+            rows: 0,
         }
     }
 
@@ -119,6 +122,11 @@ impl Query {
     /// How the server formatted the cells (binary and geometry encodings, time zone).
     pub fn settings(&self) -> &QueryResultFormatSettings {
         &self.settings
+    }
+
+    /// The rows the responses have given so far.
+    pub fn rows_received(&self) -> usize {
+        self.rows
     }
 
     /// Whether the query is over: its final response came, or it needs none.
@@ -217,6 +225,14 @@ impl Query {
             self.settings = settings;
         }
         check_rows(&resp.data, self.schema.len())?;
+        self.rows = self.rows.saturating_add(resp.data.len());
+        if let Some(max) = client.max_rows() {
+            if self.rows > max {
+                return Err(Error::Protocol(format!(
+                    "the statement returned more than {max} rows"
+                )));
+            }
+        }
         let next_path = match resp.next_uri {
             // the final response ends the query, whatever it says next
             Some(_) if was_final => None,
