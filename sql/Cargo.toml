@@ -11,7 +11,10 @@ authors = { workspace = true }
 repository = { workspace = true }
 
 [features]
+default = ["arbitrary-precision"]
 flight-sql = ["dep:tonic"]
+# Decimals in VARIANT values keep every digit when shown as text (else they go through f64).
+arbitrary-precision = ["jsonb/arbitrary_precision"]
 
 [dependencies]
 arrow = { workspace = true }

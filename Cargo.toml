@@ -24,10 +24,18 @@ repository = "https://github.com/databendlabs/bendsql"
 [workspace.dependencies]
 databend-client = { path = "core", version = "0.34.3" }
 databend-driver = { path = "driver", version = "0.34.3" }
-databend-driver-core = { path = "sql", version = "0.34.3" }
+# Without its default `arbitrary-precision`: `databend-driver` turns it on by its own default, and
+# programs that turn that off (feature unification) keep serde_json's usual numbers.
+databend-driver-core = { path = "sql", version = "0.34.3", default-features = false }
 databend-driver-macros = { path = "macros", version = "0.34.3" }
 
-jsonb = { version = "0.5.6" }
+# Without jsonb's defaults, which turn on serde_json's `arbitrary_precision` and `preserve_order`
+# in every program using the driver; `arbitrary-precision` (databend-driver-core) turns it back on.
+jsonb = { version = "0.5.6", default-features = false, features = ["databend"] }
+# The SQL parser, at the commit whose serde_json no longer turns on `preserve_order` and
+# `unbounded_depth` (released as a version once tested).
+#databend-common-ast = { git = "https://github.com/b41sh/databend.git", rev = "cad396f3b5413f4a0e09eb3d9168ed092ceda27c" }
+databend-common-ast = { git = "https://github.com/b41sh/databend.git", rev = "8fd75d3e15bb9127d7dfe17097bad6e82666d33f" }
 tokio-stream = "0.1"
 chrono = { version = "0.4.40", default-features = false, features = ["clock"] }
 chrono-tz = { version = "0.10.4" }
